@@ -992,6 +992,7 @@ int main(void)
     char *debug_cfg_path = "debug_conf.json"; /* if present, all other configuration files are ignored */
 
     /* threads */
+    pthread_t thrid_flag;
     pthread_t thrid_up;
     pthread_t thrid_down;
     pthread_t thrid_gps;
