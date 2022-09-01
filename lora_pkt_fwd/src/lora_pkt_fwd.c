@@ -1424,6 +1424,7 @@ int main(void)
     pthread_cancel(thrid_down); /* don't wait for downstream thread */
     pthread_cancel(thrid_jit); /* don't wait for jit thread */
     pthread_cancel(thrid_timersync); /* don't wait for timer sync thread */
+    pthread_cancel(thrid_flag); /* kill input flag thread */
     if (gps_enabled == true) {
         pthread_cancel(thrid_gps); /* don't wait for GPS thread */
         pthread_cancel(thrid_valid); /* don't wait for validation thread */
