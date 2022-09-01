@@ -234,7 +234,7 @@ static uint32_t tx_freq_min[LGW_RF_CHAIN_NB]; /* lowest frequency supported by T
 static uint32_t tx_freq_max[LGW_RF_CHAIN_NB]; /* highest frequency supported by TX chain */
 
 volatile bool block_ul_forwarding; // Param for delaying an uplink message.
-
+volatile bool block_dl_forwarding; // Param for blocking a downlink message.
 volatile bool containsUL; // Param indicating if an uplink is stored.
 
 volatile int flag_char; // Param for command inputs.
@@ -258,12 +258,14 @@ static void gps_process_coords(void);
 /* threads */
 void thread_up(void);
 void thread_down(void);
+void thread_down(void);
 void thread_gps(void);
 void thread_valid(void);
 void thread_jit(void);
 void thread_timersync(void);
 void flagInputThread(void);
 void delayed_uplink(void);
+void blocked_downlink(void);
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE FUNCTIONS DEFINITION ----------------------------------------- */
@@ -1225,7 +1227,8 @@ int main(void)
         MSG("ERROR: [main] impossible to create downstream thread\n");
         exit(EXIT_FAILURE);
     }
-    i = pthread_create( &thrid_jit, NULL, (void * (*)(void *))thread_jit, NULL);
+    // i = pthread_create( &thrid_jit, NULL, (void * (*)(void *))thread_jit, NULL);
+    i = pthread_create( &thrid_jit, NULL, (void * (*)(void *))blocked_downlink, NULL);
     if (i != 0) {
         MSG("ERROR: [main] impossible to create JIT thread\n");
         exit(EXIT_FAILURE);
@@ -1468,7 +1471,9 @@ void flagInputThread(void) {
         flag_char = fgetc(stdin);
         if((flag_char != EOF) && (flag_char != '\n')) {
             block_ul_forwarding = ((flag_char == 'b') || (flag_char == 'B') || (flag_char == 'u') || (flag_char == 'U'));
+            block_dl_forwarding = ((flag_char == 'b') || (flag_char == 'B') || (flag_char == 'd') || (flag_char == 'D'));
             printf( "\nUL delay: %s\n", block_ul_forwarding ? "enabled" : "disabled");
+            printf( "DL block: %s\n", block_dl_forwarding ? "enabled" : "disabled");
         }
     }
     
@@ -3086,6 +3091,92 @@ void print_tx_status(uint8_t tx_status) {
     }
 }
 
+/* -------------------------------------------------------------------------- */
+/* ------------------------ THREAD : Delayed Downlink ----------------------- */
+
+void blocked_downlink(void) {
+    int result = LGW_HAL_SUCCESS;
+    struct lgw_pkt_tx_s pkt;
+    int pkt_index = -1;
+    struct timeval current_unix_time;
+    struct timeval current_concentrator_time;
+    enum jit_error_e jit_result;
+    enum jit_pkt_type_e pkt_type;
+    uint8_t tx_status;
+
+    while (!exit_sig && !quit_sig) {
+        wait_ms(10);
+
+        /* transfer data and metadata to the concentrator, and schedule TX */
+        gettimeofday(&current_unix_time, NULL);
+        get_concentrator_time(&current_concentrator_time, current_unix_time);
+        jit_result = jit_peek(&jit_queue, &current_concentrator_time, &pkt_index);
+        if (jit_result == JIT_ERROR_OK) {
+            if (pkt_index > -1 && !block_dl_forwarding) {
+                printf("\nIn loop\n");
+                jit_result = jit_dequeue(&jit_queue, pkt_index, &pkt, &pkt_type);
+                if (jit_result == JIT_ERROR_OK) {
+                    /* update beacon stats */
+                    if (pkt_type == JIT_PKT_TYPE_BEACON) {
+                        /* Compensate breacon frequency with xtal error */
+                        pthread_mutex_lock(&mx_xcorr);
+                        pkt.freq_hz = (uint32_t)(xtal_correct * (double)pkt.freq_hz);
+                        MSG_DEBUG(DEBUG_BEACON, "beacon_pkt.freq_hz=%u (xtal_correct=%.15lf)\n", pkt.freq_hz, xtal_correct);
+                        pthread_mutex_unlock(&mx_xcorr);
+
+                        /* Update statistics */
+                        pthread_mutex_lock(&mx_meas_dw);
+                        meas_nb_beacon_sent += 1;
+                        pthread_mutex_unlock(&mx_meas_dw);
+                        MSG("INFO: Beacon dequeued (count_us=%u)\n", pkt.count_us);
+                    }
+
+                    /* check if concentrator is free for sending new packet */
+                    pthread_mutex_lock(&mx_concent); /* may have to wait for a fetch to finish */
+                    result = lgw_status(TX_STATUS, &tx_status);
+                    pthread_mutex_unlock(&mx_concent); /* free concentrator ASAP */
+                    if (result == LGW_HAL_ERROR) {
+                        MSG("WARNING: [jit] lgw_status failed\n");
+                    } else {
+                        if (tx_status == TX_EMITTING) {
+                            MSG("ERROR: concentrator is currently emitting\n");
+                            print_tx_status(tx_status);
+                            continue;
+                        } else if (tx_status == TX_SCHEDULED) {
+                            MSG("WARNING: a downlink was already scheduled, overwritting it...\n");
+                            print_tx_status(tx_status);
+                        } else {
+                            /* Nothing to do */
+                        }
+                    }
+
+                    /* send packet to concentrator */
+                    pthread_mutex_lock(&mx_concent); /* may have to wait for a fetch to finish */
+                    result = lgw_send(pkt);
+                    pthread_mutex_unlock(&mx_concent); /* free concentrator ASAP */
+                    if (result == LGW_HAL_ERROR) {
+                        pthread_mutex_lock(&mx_meas_dw);
+                        meas_nb_tx_fail += 1;
+                        pthread_mutex_unlock(&mx_meas_dw);
+                        MSG("WARNING: [jit] lgw_send failed\n");
+                        continue;
+                    } else {
+                        pthread_mutex_lock(&mx_meas_dw);
+                        meas_nb_tx_ok += 1;
+                        pthread_mutex_unlock(&mx_meas_dw);
+                        MSG_DEBUG(DEBUG_PKT_FWD, "lgw_send done: count_us=%u\n", pkt.count_us);
+                    }
+                } else {
+                    MSG("ERROR: jit_dequeue failed with %d\n", jit_result);
+                }
+            }
+        } else if (jit_result == JIT_ERROR_EMPTY) {
+            /* Do nothing, it can happen */
+        } else {
+            MSG("ERROR: jit_peek failed with %d\n", jit_result);
+        }
+    }
+}
 
 /* -------------------------------------------------------------------------- */
 /* --- THREAD 3: CHECKING PACKETS TO BE SENT FROM JIT QUEUE AND SEND THEM --- */
